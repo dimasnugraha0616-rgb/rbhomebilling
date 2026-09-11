@@ -3,7 +3,7 @@
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width,initial-scale=1">
-    <title>RB HOME NET — Billing &amp; Finance v40.0</title>
+    <title>RB HOME NET — Billing &amp; Finance v42.0</title>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
     <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
@@ -806,6 +806,43 @@
 </div>
 
 <script>
+// v42 CHANGELOG (FIX BUG PELAPORAN PENGGUNA):
+// 1) TAGIHAN (Irma Siskawati) MUNCUL LALU HILANG setelah generate — dua
+//    penyebab diperbaiki sekaligus:
+//    (a) merge tombstone kini mengecek WAKTU penghapusan (t.at): item yang
+//        dibuat/diubah SETELAH penghapusan tidak ikut terhapus saat merge
+//        cloud antar perangkat;
+//    (b) nomor invoice hasil generate/approve kini mendapat SUFIKS UNIK per
+//        perangkat — sebelumnya dua perangkat bisa menghasilkan nomor invoice
+//        yang sama (lastInvoiceSeq tabrakan) sehingga invoice di satu perangkat
+//        terhapus oleh tombstone perangkat lain saat sinkronisasi.
+// 2) DATA DUPLIKAT muncul lagi saat edit pelanggan dengan nomor WA kosong:
+//    pembersih duplikat kini juga menggabungkan berdasarkan NAMA bila nomor WA
+//    kosong/tidak valid (atau alamat sama), dan nomor WA keeper yang kosong
+//    otomatis diisi dari data duplikat yang punya nomor valid.
+// 3) INVOICE PDF add-on: kata "Sekali Bayar / Layanan Tambahan" dihapus —
+//    deskripsi hanya menampilkan nama layanan add-on (mis. "Biaya Pemasangan
+//    Baru"). Berlaku juga untuk data lama (sufiks dibersihkan saat PDF dibuat).
+// 4) LOG AKTIVITAS: deteksi IP kini ber-fallback (ipapi.co -> ipwho.is ->
+//    ipify) sehingga IP hampir selalu tercatat.
+// 5) POST cloud diberi timeout 12 detik agar tidak menggantung saat jaringan
+//    macet (logout/aksi terasa macet).
+// v41 CHANGELOG (PERBAIKAN BUG PELAPORAN PENGGUNA):
+// 1) INVOICE PDF ADD-ON/SEKALI BAYAR: sebelumnya deskripsi selalu "Internet
+//    Broadband Paket ..." walau tagihannya add-on (contoh: biaya pasang baru
+//    tercetak paket 10 Mbps). Sekarang invoice add-on membawa field `desc`
+//    dan PDF menampilkan nama layanan add-on yang benar (juga di bukti bayar).
+// 2) GENERATE TAGIHAN "ADA PELANGGAN YANG TIDAK BISA" (laporan: Irma Siskawati):
+//    penyebabnya skip SENYAP — (a) nextBillMonth lebih maju dari periode
+//    dipilih, (b) jenis Add-on, (c) harga paket 0, (d) tagihan sudah ada.
+//    Sekarang setiap generate menampilkan ringkasan: berhasil + SIAPA SAJA
+//    yang dilewati beserta ALASANNYA, sehingga tidak ada lagi yang "hilang"
+//    tanpa penjelasan.
+// 3) DUPLIKAT DATA PELANGGAN saat mengubah data pelanggan RB-AUTO: entri
+//    ganda (nomor WA sama, ID berbeda) kini otomatis DIGABUNG menjadi satu —
+//    data terbaru menjadi penampung, tagihan & riwayat bayar milik entri
+//    duplikat dipindahkan ke penampung (tidak muncul "N/A"). Pembersihan
+//    otomatis berjalan saat aplikasi dibuka & setiap simpan pelanggan.
 // v40 CHANGELOG (MOBILE — ZOOM OUT LEBIH JAUH & PANEL FULL-BLEED):
 // 1) Zoom mobile ditingkatkan 0.8x -> 0.6x: seluruh halaman mobile jauh lebih
 //    lega, header lebih ringkas, lebih banyak kolom tabel terlihat sekaligus,
@@ -928,6 +965,12 @@ const CLOUD_URL = 'https://script.google.com/macros/s/AKfycbx4QcBG-ztH6Im1OSWV8q
 const INSTANCE_ID = 'RBNET-OWNER-SYNC-2026'; // Sidik pemilik: tolak & pulihkan data asing di cloud
 const PPN_RATE = 0.11;
 const monthNamesIndo = ["Januari", "Februari", "Maret", "April", "Mei", "Juni", "Juli", "Agustus", "September", "Oktober", "November", "Desember"];
+// v42: sufiks unik nomor invoice — mencegah tabrakan nomor antar perangkat
+// (dua perangkat generate nomor sama -> salah satunya terhapus oleh tombstone
+// perangkat lain saat sinkronisasi; inilah penyebab tagihan "muncul lalu hilang").
+function uniqueInvSuffix() {
+    return Date.now().toString(36).toUpperCase().slice(-3) + Math.floor(Math.random() * 46656).toString(36).toUpperCase().padStart(3, '0');
+}
 
 // ================= DATABASE =================
 let db;
@@ -1098,9 +1141,16 @@ function mergeSettings(local, cloud) {
 }
 
 function mergeDatabases(local, cloud) {
-    const tomb = new Set();
+    // v42 FIX: tombstone kini membaca WAKTU penghapusan (t.at). Item yang
+    // dibuat/diubah SETELAH waktu penghapusan tidak ikut terhapus saat merge —
+    // penyebab tagihan (Irma Siskawati) "muncul lalu hilang" setelah sinkronisasi.
+    const tomb = new Map();
     const allTombs = (local.tombstones || []).concat(cloud.tombstones || []);
-    allTombs.forEach(t => tomb.add(t.type + '::' + String(t.id)));
+    allTombs.forEach(t => {
+        const k = t.type + '::' + String(t.id);
+        const tm = Number(t.at) || 0;
+        if(!tomb.has(k) || tm > tomb.get(k)) tomb.set(k, tm);
+    });
     const merged = {};
     SYNC_COLLECTIONS.forEach(k => {
         const map = new Map();
@@ -1115,7 +1165,11 @@ function mergeDatabases(local, cloud) {
             if(loc && typeof loc.updatedAt === 'number' && loc.updatedAt > (Number(it.updatedAt) || 0)) return;
             map.set(key, it);
         });
-        merged[k] = Array.from(map.values()).filter(it => !tomb.has(k + '::' + String(it.id)));
+        merged[k] = Array.from(map.values()).filter(it => {
+            const tm = tomb.get(k + '::' + String(it.id));
+            if(!tm) return true;
+            return (Number(it.updatedAt) || 0) > tm;
+        });
     });
     // v34: log gabungan dibatasi 100 entri terbaru — bila dua perangkat masing-
     // masing punya 100 log, merge bisa menghasilkan 200+ dan memperlambat sync.
@@ -1196,13 +1250,17 @@ async function postToCloudWithVerify(maxAttempts = 5) {
     setSyncState({ pending: true, lastLocalWrite: expected });
     for(let attempt = 0; attempt < maxAttempts; attempt++) {
         try {
-            await fetch(CLOUD_URL, {
-                method: 'POST',
-                mode: 'no-cors',
-                cache: 'no-store',
-                headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-                body: JSON.stringify(db)
-            });
+            // v42: timeout 12 detik agar POST tidak menggantung saat jaringan macet
+            await Promise.race([
+                fetch(CLOUD_URL, {
+                    method: 'POST',
+                    mode: 'no-cors',
+                    cache: 'no-store',
+                    headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+                    body: JSON.stringify(db)
+                }),
+                new Promise(r => setTimeout(() => r(null), 12000))
+            ]);
         } catch(e) { /* jaringan bermasalah — lanjut ke verifikasi/retry */ }
         await new Promise(r => setTimeout(r, 800 + attempt * 900)); // v34: lebih cepat
         try {
@@ -1329,17 +1387,34 @@ function addLog(action) {
     renderLogs();
     schedulePush(1200); // v34: debounce — tidak menahan UI
 
-    // Coba isi IP publik; jika layanan tidak tersedia, log tetap tersimpan.
+    // v42: coba isi IP publik dengan 3 lapis fallback (ipapi.co -> ipwho.is
+    // -> ipify); log tetap tersimpan walau semua layanan sedang tidak tersedia.
+    const applyIpInfo = (ip, isp, loc) => {
+        entry.ip = ip || '-';
+        entry.isp = isp || '-';
+        if(loc) entry.location = loc;
+        cacheDb();
+        renderLogs();
+        schedulePush(1500); // v34: debounce
+    };
     fetch('https://ipapi.co/json/?t=' + Date.now(), { cache:'no-store' })
         .then(r => r.json())
         .then(d => {
-            entry.ip = d.ip || '-';
-            entry.isp = d.org || d.asn || '-';
-            entry.location = [d.city, d.region, d.country_name].filter(Boolean).join(', ') || entry.location;
-            cacheDb();
-            renderLogs();
-            schedulePush(1500); // v34: debounce
-        }).catch(() => {});
+            if(!d || !d.ip) throw new Error('no-ip');
+            applyIpInfo(d.ip, d.org || d.asn, [d.city, d.region, d.country_name].filter(Boolean).join(', '));
+        })
+        .catch(() => fetch('https://ipwho.is/?t=' + Date.now(), { cache:'no-store' })
+            .then(r => r.json())
+            .then(d => {
+                if(!d || d.success === false || !d.ip) throw new Error('no-ip');
+                applyIpInfo(d.ip, d.connection && (d.connection.isp || d.connection.asn), [d.city, d.region, d.country].filter(Boolean).join(', '));
+            })
+            .catch(() => fetch('https://api.ipify.org?format=json', { cache:'no-store' })
+                .then(r => r.json())
+                .then(d => applyIpInfo(d.ip, '', ''))
+                .catch(() => {})
+            )
+        );
 }
 // v36: Log Aktivitas ber-pagination (default 10 per halaman, bisa diatur).
 let logPage = 1;
@@ -1613,6 +1688,62 @@ function toggleSidebar() {
     toast('Mode tampilan: ' + (appMode === 'mobile' ? 'MOBILE (ikon)' : 'DESKTOP (full)'), 'success');
 }
 
+// v41/v42: FIX duplikat pelanggan (hasil sinkronisasi / pengeditan data):
+// entri dengan nomor WhatsApp yang sama DIGABUNG menjadi SATU — data dengan
+// updatedAt terbaru menjadi penampung, tagihan & riwayat bayar milik entri
+// duplikat dipindahkan ke penampung (tidak muncul "N/A"). v42: penggabungan
+// juga berlaku berdasarkan NAMA bila nomor WA kosong/tidak valid (atau alamat
+// sama) — inilah penyebab "duplikat muncul lagi" saat edit pelanggan dengan
+// nomor WA dikosongkan.
+function mergeDuplicateCustomers() {
+    const digits = v => String(v || '').replace(/\D/g, '');
+    const dropIds = new Set();
+    const mergePair = (a, b) => {
+        let keeper = a, drop = b;
+        if((Number(b.updatedAt) || 0) > (Number(a.updatedAt) || 0)) { keeper = b; drop = a; }
+        ['name','address','package','status','price','installDate','dueDay','dueDate','billType','nextBillMonth'].forEach(k => {
+            if((keeper[k] === undefined || keeper[k] === '' || keeper[k] === null) && drop[k] !== undefined && drop[k] !== '') keeper[k] = drop[k];
+        });
+        // v42: keeper dengan nomor WA kosong otomatis diisi nomor duplikat yang valid
+        if(digits(keeper.phone).length < 10 && digits(drop.phone).length >= 10) keeper.phone = drop.phone;
+        if(drop.pendingApproval) keeper.pendingApproval = true;
+        dropIds.add(String(drop.id));
+        tombstone('customers', drop.id);
+        db.invoices.forEach(i => { if(String(i.customerId) === String(drop.id)) { i.customerId = keeper.id; i.updatedAt = Date.now(); } });
+        db.payments.forEach(p => { if(String(p.customerId) === String(drop.id)) { p.customerId = keeper.id; p.updatedAt = Date.now(); } });
+        return keeper;
+    };
+    // Lapis 1: gabung berdasarkan nomor WhatsApp
+    const seenPh = new Map();
+    db.customers.forEach(c => {
+        const ph = digits(c.phone);
+        if(ph.length < 10) return;
+        if(!seenPh.has(ph)) { seenPh.set(ph, c); return; }
+        seenPh.set(ph, mergePair(seenPh.get(ph), c));
+    });
+    if(dropIds.size) db.customers = db.customers.filter(c => !dropIds.has(String(c.id)));
+    // Lapis 2 (v42): gabung berdasarkan NAMA bila nomor WA kosong/tidak valid
+    // atau alamatnya sama (nama sama + dua-duanya punya WA valid = kemungkinan
+    // orang berbeda -> TIDAK digabung demi keamanan).
+    const seenNm = new Map();
+    db.customers.forEach(c => {
+        const nm = String(c.name || '').trim().toLowerCase().replace(/\s+/g, ' ');
+        if(nm.length < 3) return;
+        if(!seenNm.has(nm)) { seenNm.set(nm, c); return; }
+        const prev = seenNm.get(nm);
+        const addrSame = String(prev.address || '').trim() !== '' &&
+                         String(prev.address || '').trim().toLowerCase() === String(c.address || '').trim().toLowerCase();
+        const waKosong = digits(prev.phone).length < 10 || digits(c.phone).length < 10;
+        if(!addrSame && !waKosong) return;
+        seenNm.set(nm, mergePair(prev, c));
+    });
+    if(dropIds.size) {
+        db.customers = db.customers.filter(c => !dropIds.has(String(c.id)));
+        if(typeof addLog === 'function') addLog('Membersihkan ' + dropIds.size + ' data pelanggan duplikat (nomor WA / nama sama)');
+    }
+    return dropIds.size;
+}
+
 // ================= INIT =================
 function initApp() {
     const session = JSON.parse(sessionStorage.getItem(SESSION_KEY) || 'null');
@@ -1632,6 +1763,7 @@ function initApp() {
         }
         refreshSettingsInputs();
         migrateLargeImages(); // v33: perkecil logo/QRIS lama yang terlalu besar
+        mergeDuplicateCustomers(); // v41: gabung data pelanggan duplikat (nomor WA sama)
         const ppnEl = document.getElementById('setPpnInclude');
         if(ppnEl) ppnEl.checked = db.settings.ppnInclude !== false;
         updateBrandUI();
@@ -1875,7 +2007,7 @@ function approveRegistration(id) {
         if(!db.invoices.some(i => i.customerId === c.id && i.month === invMonth)) {
             const isAddon = c.billType === 'addon';
             db.settings.lastInvoiceSeq++;
-            const invId = db.settings.prefix + '-' + invMonth.replace('-', '') + '-' + String(db.settings.lastInvoiceSeq).padStart(4, '0');
+            const invId = db.settings.prefix + '-' + invMonth.replace('-', '') + '-' + String(db.settings.lastInvoiceSeq).padStart(4, '0') + '-' + uniqueInvSuffix();
             db.invoices.push({
                 id: invId,
                 customerId: c.id,
@@ -1883,6 +2015,7 @@ function approveRegistration(id) {
                 amount: c.price || 0,
                 dueDate: isAddon ? (c.dueDate || c.installDate || dueDateForMonth(invMonth, c)) : dueDateForMonth(invMonth, c),
                 status: isAddon ? 'Sekali Bayar (Add-on: ' + (c.package || 'Lain-lain') + ')' : 'Belum Bayar',
+                desc: isAddon ? (c.package || 'Lain-lain') : '', // v42: PDF hanya nama layanan
                 discount: 0,
                 ppnInclude: db.settings.ppnInclude !== false,
                 updatedAt: Date.now()
@@ -2267,7 +2400,7 @@ function saveOneTimeInvoice() {
     const due = document.getElementById('otDue').value || new Date().toISOString().slice(0,10);
     if(price <= 0) return alert("Masukkan nominal!");
     const invId = db.settings.prefix + '-ADD-' + Date.now().toString().slice(-4);
-    db.invoices.push({ id: invId, customerId: cid, month: currentActiveMonth, amount: price, dueDate: due, status: 'Sekali Bayar (Add-on: ' + aName + ')', discount: 0, ppnInclude: db.settings.ppnInclude !== false, updatedAt: Date.now() });
+    db.invoices.push({ id: invId, customerId: cid, month: currentActiveMonth, amount: price, dueDate: due, status: 'Sekali Bayar (Add-on: ' + aName + ')', desc: aName, discount: 0, ppnInclude: db.settings.ppnInclude !== false, updatedAt: Date.now() }); // v42: desc PDF hanya nama layanan
     addLog('Membuat invoice sekali bayar "' + aName + '" (' + rupiah(price) + ')');
     save(); closeModal();
     toast('Invoice sekali bayar ' + rupiah(price) + ' berhasil dibuat!', 'success');
@@ -2392,6 +2525,7 @@ function saveCustomer(oldId) {
         addLog('Menambah pelanggan baru: ' + data.name);
         addNotification('Pelanggan baru ditambahkan: <b>' + data.name + '</b> (' + data.id + ')');
     }
+    mergeDuplicateCustomers(); // v41: pastikan tidak ada duplikat setelah edit
     save(); closeModal();
     toast('Data pelanggan "' + data.name + '" berhasil disimpan', 'success');
 }
@@ -2414,22 +2548,26 @@ function processGeneration() {
     const selectedIds = Array.from(document.querySelectorAll('.gen-check:checked')).map(el => el.value);
     if(!month || selectedIds.length === 0) return alert('Pilih pelanggan!');
     let made = 0;
+    const skipped = [];
     selectedIds.forEach(cid => {
-        if(!db.invoices.some(inv => inv.customerId === cid && inv.month === month)) {
-            const c = db.customers.find(x => x.id === cid);
-            if(!c) return;
-            if(c.billType === 'addon') return;
-            if(c.nextBillMonth && month < c.nextBillMonth) return;
-            db.settings.lastInvoiceSeq++;
-            const invId = db.settings.prefix + '-' + month.replace('-', '') + '-' + String(db.settings.lastInvoiceSeq).padStart(4, '0');
-            db.invoices.push({ id: invId, customerId: cid, month: month, amount: c.price || 0, dueDate: dueDateForMonth(month, c), status: 'Belum Bayar', discount: 0, ppnInclude: db.settings.ppnInclude !== false, updatedAt: Date.now() });
-            made++;
-        }
+        const c = db.customers.find(x => x.id === cid);
+        if(!c) { skipped.push(cid + ' — data tidak ditemukan'); return; }
+        // v41: SEMUA alasan skip kini DILAPORKAN (tidak senyap lagi) —
+        // inilah penyebab "pelanggan tidak bisa generate tagihan".
+        if(db.invoices.some(inv => inv.customerId === cid && inv.month === month)) { skipped.push(c.name + ' — tagihan ' + getFormattedMonth(month) + ' sudah ada'); return; }
+        if(c.billType === 'addon') { skipped.push(c.name + ' — jenis Add-on/sekali bayar (tidak digenerate bulanan; pakai "Invoice Baru (Sekali Bayar)")'); return; }
+        if(!(c.price > 0)) { skipped.push(c.name + ' — harga paket Rp 0 / paket tidak ditemukan (perbarui paket pelanggan)'); return; }
+        if(c.nextBillMonth && month < c.nextBillMonth) { skipped.push(c.name + ' — tagihan pertama baru bulan ' + getFormattedMonth(c.nextBillMonth) + ' (sesuai tgl pemasangan ' + (c.installDate || '-') + ')'); return; }
+        db.settings.lastInvoiceSeq++;
+        const invId = db.settings.prefix + '-' + month.replace('-', '') + '-' + String(db.settings.lastInvoiceSeq).padStart(4, '0') + '-' + uniqueInvSuffix();
+        db.invoices.push({ id: invId, customerId: cid, month: month, amount: c.price || 0, dueDate: dueDateForMonth(month, c), status: 'Belum Bayar', discount: 0, ppnInclude: db.settings.ppnInclude !== false, updatedAt: Date.now() });
+        made++;
     });
     currentActiveMonth = month;
-    addLog('Generate manual ' + made + ' tagihan periode ' + getFormattedMonth(month));
+    addLog('Generate manual ' + made + ' tagihan periode ' + getFormattedMonth(month) + (skipped.length ? ' (' + skipped.length + ' dilewati)' : ''));
     save(); closeModal(); nav('invoices');
-    toast(made + ' tagihan ' + getFormattedMonth(month) + ' berhasil dibuat', 'success');
+    if(skipped.length) alert('Berhasil dibuat: ' + made + ' tagihan.\n\nDILEWATI (' + skipped.length + '):\n- ' + skipped.join('\n- '));
+    toast(made + ' tagihan ' + getFormattedMonth(month) + ' berhasil dibuat' + (skipped.length ? ' (' + skipped.length + ' dilewati)' : ''), 'success');
 }
 
 // ================= UBAH NOMOR INVOICE =================
@@ -2522,6 +2660,7 @@ function finalizePayment(method) {
         month: inv.month,
         dueDate: inv.dueDate,
         packagePrice: inv.amount,
+        desc: inv.desc || '',
         discount: discount,
         ppnInclude: m.include,
         updatedAt: Date.now()
@@ -2760,7 +2899,7 @@ function saveSettings() {
 }
 
 // ================= INVOICE PDF =================
-function generateInvoiceHTML(invId, cust, month, dueDate, amount, status, discount, ppnInclude) {
+function generateInvoiceHTML(invId, cust, month, dueDate, amount, status, discount, ppnInclude, desc) {
     const logoSrc = db.settings.logo || DEFAULT_LOGO;
     const isLunas = status === 'Lunas' || (db.payments.some(p => p.invoiceId === invId && p.status === 'Lunas'));
     const disc = discount || 0;
@@ -2816,7 +2955,7 @@ function generateInvoiceHTML(invId, cust, month, dueDate, amount, status, discou
         .desc { font-weight: 700; font-size: 15px; }
         .stamp { position: absolute; top: 40%; left: 35%; transform: rotate(-20deg); border: 8px solid ${stampColor}; color: ${stampColor}; font-size: 60px; font-weight: 900; padding: 10px 30px; border-radius: 15px; z-index:10; pointer-events: none; }
     </style></head><body><div class="container"><div class="stamp">${stampText}</div><div class="header"><img src="${logoSrc}" alt="logo"><div><h1>${brandName()}</h1><p class="company">${companyName()}</p><p class="addr">${db.settings.address || ''}</p></div></div><div class="info-grid"><div class="box"><b>TAGIHAN KEPADA:</b><br>ID: ${cust.id}<br><b>${cust.name}</b><br>${cust.phone || '-'}<br>Alamat: ${cust.address || '-'}</div><div class="box"><b>DETAIL:</b><br>No: ${invId}<br>Periode: <b>${periodeNama}</b><br>Tempo: ${dueDate || '-'}</div></div><table><thead><tr><th>Deskripsi</th><th style="text-align:right">Jumlah</th></tr></thead><tbody>
-        <tr><td class="desc">Internet Broadband Paket ${cust.package || '-'}</td><td style="text-align:right" class="desc">${rupiah(subtotal)}</td></tr>
+        <tr><td class="desc">${(desc || ('Internet Broadband Paket ' + (cust.package || '-')))}</td><td style="text-align:right" class="desc">${rupiah(subtotal)}</td></tr>
         ${disc > 0 ? `<tr><td class="desc" style="color:#dc2626;">DISKON</td><td style="text-align:right; color:#dc2626;" class="desc">(-) ${rupiah(disc)}</td></tr>` : ''}
         ${include
             ? `<tr><td class="desc" style="color:#475569;">Harga Sudah Termasuk PPN 11%</td><td style="text-align:right; color:#475569;" class="desc">Termasuk</td></tr>`
@@ -2830,7 +2969,11 @@ function downloadInvoiceForPending(id) {
     const inv = db.invoices.find(x => x.id === id);
     if(!inv) return;
     const c = db.customers.find(x => x.id === inv.customerId) || { id: '-', name: 'N/A', phone: '-', package: '-', address: '-' };
-    const html = generateInvoiceHTML(inv.id, c, inv.month, inv.dueDate, inv.amount, inv.status, inv.discount, inv.ppnInclude);
+    // v42: deskripsi PDF hanya nama layanan add-on — tanpa kata "Sekali Bayar"
+    // (termasuk membersihkan sufiks lama pada data yang sudah tersimpan).
+    let invDesc = (inv.desc || '').replace(/\s*\(Layanan Tambahan — Sekali Bayar\)\s*$/i, '');
+    if(!invDesc && inv.status && inv.status.indexOf('Add-on:') !== -1) invDesc = inv.status.replace(/^Sekali Bayar \(Add-on:\s*/, '').replace(/\)$/, '');
+    const html = generateInvoiceHTML(inv.id, c, inv.month, inv.dueDate, inv.amount, inv.status, inv.discount, inv.ppnInclude, invDesc);
     const blob = new Blob([html], { type: 'text/html' });
     const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = `Pending_${inv.id}.html`; a.click();
 }
@@ -2838,7 +2981,9 @@ function downloadInvoiceFromHistory(payId) {
     const p = db.payments.find(x => String(x.id) === String(payId));
     if(!p) return;
     const c = db.customers.find(x => x.id === p.customerId) || { id: '-', name: 'N/A', phone: '-', package: '-', address: '-' };
-    const html = generateInvoiceHTML(p.invoiceId, c, p.month || '-', p.dueDate || '-', p.packagePrice || p.amount, p.status, p.discount, p.ppnInclude);
+    // v42: bersihkan sufiks lama " (Layanan Tambahan — Sekali Bayar)" bila ada
+    const pDesc = (p.desc || '').replace(/\s*\(Layanan Tambahan — Sekali Bayar\)\s*$/i, '');
+    const html = generateInvoiceHTML(p.invoiceId, c, p.month || '-', p.dueDate || '-', p.packagePrice || p.amount, p.status, p.discount, p.ppnInclude, pDesc);
     const blob = new Blob([html], { type: 'text/html' });
     const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = `Bukti_${p.invoiceId}.html`; a.click();
 }
